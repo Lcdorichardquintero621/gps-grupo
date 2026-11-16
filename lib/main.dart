@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:math';
-
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
@@ -65,7 +64,8 @@ class _InicioPageState extends State<InicioPage> {
     await p.setString('nombre', nombre);
     var id = p.getString('device_id');
     if (id == null) {
-      id = '${DateTime.now().microsecondsSinceEpoch}-${Random.secure().nextInt(1 << 32)}';
+      id =
+          '${DateTime.now().microsecondsSinceEpoch}-${Random.secure().nextInt(1 << 32)}';
       await p.setString('device_id', id);
     }
     if (!mounted) return;
@@ -129,41 +129,99 @@ class MapaPage extends StatefulWidget {
 class _MapaPageState extends State<MapaPage> {
   final _map = MapController();
   StreamSubscription<Position>? _gps;
+  Timer? _latido;
+  Position? _pos;
+  bool _mapaListo = false;
   bool _centrado = false;
   bool _compartiendo = true;
+  String _estado = 'Iniciando…';
+  bool _estadoError = false;
+
+  // El stream se crea UNA sola vez (antes se recreaba en cada rebuild).
+  late final Stream<List<Map<String, dynamic>>> _stream = db
+      .from('ubicaciones')
+      .stream(primaryKey: ['device_id']).eq('grupo', widget.grupo);
 
   @override
   void initState() {
     super.initState();
     _iniciarGps();
+    // Reenvía la posición cada 20 s aunque no te muevas.
+    _latido = Timer.periodic(const Duration(seconds: 20), (_) {
+      if (_compartiendo && _pos != null) _enviar(_pos!);
+    });
+  }
+
+  void _setEstado(String t, {bool error = false}) {
+    if (!mounted) return;
+    setState(() {
+      _estado = t;
+      _estadoError = error;
+    });
   }
 
   Future<void> _iniciarGps() async {
-    if (!await Geolocator.isLocationServiceEnabled()) return;
+    if (!await Geolocator.isLocationServiceEnabled()) {
+      _setEstado('El GPS del teléfono está apagado. Actívalo.', error: true);
+      await Geolocator.openLocationSettings();
+      return;
+    }
     var perm = await Geolocator.checkPermission();
     if (perm == LocationPermission.denied) {
       perm = await Geolocator.requestPermission();
     }
-    if (perm == LocationPermission.denied ||
-        perm == LocationPermission.deniedForever) return;
+    if (perm == LocationPermission.denied) {
+      _setEstado('Sin permiso de ubicación. Vuelve a entrar y acepta.',
+          error: true);
+      return;
+    }
+    if (perm == LocationPermission.deniedForever) {
+      _setEstado(
+          'Permiso de ubicación bloqueado. Actívalo en Ajustes > Apps > GPS Grupo.',
+          error: true);
+      await Geolocator.openAppSettings();
+      return;
+    }
+
+    _setEstado('Buscando tu ubicación…');
+
+    // Última posición conocida: centra el mapa y comparte casi al instante.
+    try {
+      final last = await Geolocator.getLastKnownPosition();
+      if (last != null) _alRecibir(last);
+    } catch (_) {}
 
     _gps = Geolocator.getPositionStream(
       locationSettings: AndroidSettings(
         accuracy: LocationAccuracy.high,
-        distanceFilter: 10,
+        distanceFilter: 5,
+        intervalDuration: const Duration(seconds: 5),
         foregroundNotificationConfig: const ForegroundNotificationConfig(
           notificationTitle: 'GPS Grupo activo',
           notificationText: 'Compartiendo tu ubicación con el grupo',
           enableWakeLock: true,
         ),
       ),
-    ).listen((pos) {
-      if (!_centrado) {
-        _centrado = true;
-        _map.move(LatLng(pos.latitude, pos.longitude), 16);
-      }
-      if (_compartiendo) _enviar(pos);
-    });
+    ).listen(
+      _alRecibir,
+      onError: (e) => _setEstado('Error de GPS: $e', error: true),
+    );
+  }
+
+  void _alRecibir(Position pos) {
+    _pos = pos;
+    _moverPrimeraVez();
+    if (_compartiendo) _enviar(pos);
+  }
+
+  void _moverPrimeraVez() {
+    if (_centrado || !_mapaListo || _pos == null) return;
+    _centrado = true;
+    try {
+      _map.move(LatLng(_pos!.latitude, _pos!.longitude), 16);
+    } catch (_) {
+      _centrado = false;
+    }
   }
 
   Future<void> _enviar(Position p) async {
@@ -175,31 +233,65 @@ class _MapaPageState extends State<MapaPage> {
         'lat': p.latitude,
         'lng': p.longitude,
         'actualizado': DateTime.now().toUtc().toIso8601String(),
-      });
+      }, onConflict: 'device_id');
+      final t = TimeOfDay.now().format(context);
+      _setEstado('Compartiendo ubicación ✓  (último envío $t)');
+    } catch (e) {
+      _setEstado('No se pudo enviar tu ubicación: $e', error: true);
+    }
+  }
+
+  Future<void> _borrarMiFila() async {
+    try {
+      await db.from('ubicaciones').delete().eq('device_id', widget.deviceId);
     } catch (_) {}
+  }
+
+  void _alternarCompartir() {
+    setState(() => _compartiendo = !_compartiendo);
+    if (_compartiendo) {
+      if (_pos != null) _enviar(_pos!);
+    } else {
+      _borrarMiFila();
+      _setEstado('Dejaste de compartir tu ubicación');
+    }
   }
 
   Future<void> _salir() async {
     _gps?.cancel();
-    try {
-      await db.from('ubicaciones').delete().eq('device_id', widget.deviceId);
-    } catch (_) {}
+    _latido?.cancel();
+    await _borrarMiFila();
     if (mounted) Navigator.pop(context);
+  }
+
+  void _verTodos(List<LatLng> pts) {
+    if (pts.isEmpty) return;
+    try {
+      if (pts.length == 1) {
+        _map.move(pts.first, 16);
+      } else {
+        _map.fitCamera(CameraFit.coordinates(
+            coordinates: pts, padding: const EdgeInsets.all(70)));
+      }
+    } catch (_) {}
   }
 
   @override
   void dispose() {
     _gps?.cancel();
+    _latido?.cancel();
+    _borrarMiFila();
     super.dispose();
+  }
+
+  bool _reciente(Map<String, dynamic> u) {
+    final t = DateTime.tryParse('${u['actualizado']}');
+    if (t == null) return true;
+    return DateTime.now().toUtc().difference(t.toUtc()).inMinutes < 15;
   }
 
   @override
   Widget build(BuildContext context) {
-    final stream = db
-        .from('ubicaciones')
-        .stream(primaryKey: ['device_id'])
-        .eq('grupo', widget.grupo);
-
     return Scaffold(
       appBar: AppBar(
         title: Text('Grupo ${widget.grupo}'),
@@ -207,20 +299,41 @@ class _MapaPageState extends State<MapaPage> {
           IconButton(
             tooltip: _compartiendo ? 'Dejar de compartir' : 'Compartir',
             icon: Icon(_compartiendo ? Icons.location_on : Icons.location_off),
-            onPressed: () => setState(() => _compartiendo = !_compartiendo),
+            onPressed: _alternarCompartir,
           ),
           IconButton(icon: const Icon(Icons.logout), onPressed: _salir),
         ],
       ),
       body: StreamBuilder<List<Map<String, dynamic>>>(
-        stream: stream,
+        stream: _stream,
         builder: (context, snap) {
-          final gente = snap.data ?? [];
+          final gente = (snap.data ?? [])
+              .where((u) => u['lat'] != null && u['lng'] != null)
+              .where(_reciente)
+              .toList();
+          final pts = gente
+              .map((u) => LatLng((u['lat'] as num).toDouble(),
+                  (u['lng'] as num).toDouble()))
+              .toList();
+
+          String estado = _estado;
+          bool error = _estadoError;
+          if (snap.hasError) {
+            estado = 'Error al leer el grupo: ${snap.error}';
+            error = true;
+          }
+
           return Stack(children: [
             FlutterMap(
               mapController: _map,
-              options: const MapOptions(
-                  initialCenter: LatLng(0, 0), initialZoom: 2),
+              options: MapOptions(
+                initialCenter: const LatLng(0, 0),
+                initialZoom: 2,
+                onMapReady: () {
+                  _mapaListo = true;
+                  _moverPrimeraVez();
+                },
+              ),
               children: [
                 TileLayer(
                   urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
@@ -241,7 +354,7 @@ class _MapaPageState extends State<MapaPage> {
                           decoration: BoxDecoration(
                               color: yo ? Colors.teal : Colors.black87,
                               borderRadius: BorderRadius.circular(8)),
-                          child: Text(u['nombre'] ?? '?',
+                          child: Text('${u['nombre'] ?? '?'}',
                               overflow: TextOverflow.ellipsis,
                               style: const TextStyle(
                                   color: Colors.white, fontSize: 12)),
@@ -257,6 +370,28 @@ class _MapaPageState extends State<MapaPage> {
                 ]),
               ],
             ),
+            // Mensaje de estado (muestra errores en vez de ocultarlos)
+            Positioned(
+              left: 12,
+              right: 12,
+              top: 12,
+              child: Card(
+                color: error ? Colors.red.shade100 : null,
+                child: Padding(
+                  padding: const EdgeInsets.all(10),
+                  child: Text(estado, style: const TextStyle(fontSize: 13)),
+                ),
+              ),
+            ),
+            Positioned(
+              right: 12,
+              bottom: 96,
+              child: FloatingActionButton.small(
+                tooltip: 'Ver a todos',
+                onPressed: () => _verTodos(pts),
+                child: const Icon(Icons.group),
+              ),
+            ),
             Positioned(
               left: 12,
               right: 12,
@@ -264,22 +399,25 @@ class _MapaPageState extends State<MapaPage> {
               child: Card(
                 child: SizedBox(
                   height: 64,
-                  child: ListView(
-                    scrollDirection: Axis.horizontal,
-                    children: gente
-                        .map((u) => Padding(
-                              padding: const EdgeInsets.all(8),
-                              child: ActionChip(
-                                avatar: const Icon(Icons.person, size: 18),
-                                label: Text(u['nombre'] ?? '?'),
-                                onPressed: () => _map.move(
-                                    LatLng((u['lat'] as num).toDouble(),
-                                        (u['lng'] as num).toDouble()),
-                                    17),
-                              ),
-                            ))
-                        .toList(),
-                  ),
+                  child: gente.isEmpty
+                      ? const Center(child: Text('Nadie compartiendo todavía'))
+                      : ListView(
+                          scrollDirection: Axis.horizontal,
+                          children: gente
+                              .map((u) => Padding(
+                                    padding: const EdgeInsets.all(8),
+                                    child: ActionChip(
+                                      avatar:
+                                          const Icon(Icons.person, size: 18),
+                                      label: Text('${u['nombre'] ?? '?'}'),
+                                      onPressed: () => _map.move(
+                                          LatLng((u['lat'] as num).toDouble(),
+                                              (u['lng'] as num).toDouble()),
+                                          17),
+                                    ),
+                                  ))
+                              .toList(),
+                        ),
                 ),
               ),
             ),
