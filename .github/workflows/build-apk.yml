@@ -1,0 +1,59 @@
+name: Build APK Geolocalizacion
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Crear carpeta android (si no existe) sin pisar mi codigo
+        run: |
+          cp pubspec.yaml /tmp/pubspec.yaml
+          cp lib/main.dart /tmp/main.dart
+          flutter create --platforms=android --org com.example --project-name gps_grupo .
+          cp /tmp/pubspec.yaml pubspec.yaml
+          cp /tmp/main.dart lib/main.dart
+          rm -rf test
+
+      - name: Nombre de la app y permisos
+        run: |
+          python3 - <<'PY'
+          import re
+          p = 'android/app/src/main/AndroidManifest.xml'
+          s = open(p, encoding='utf-8').read()
+          s = re.sub(r'android:label="[^"]*"', 'android:label="Geolocalizacion"', s, count=1)
+          perms = ['INTERNET', 'ACCESS_FINE_LOCATION', 'ACCESS_COARSE_LOCATION',
+                   'FOREGROUND_SERVICE', 'FOREGROUND_SERVICE_LOCATION', 'POST_NOTIFICATIONS']
+          add = ''.join('    <uses-permission android:name="android.permission.%s"/>\n' % x
+                        for x in perms if 'android.permission.%s"' % x not in s)
+          s = s.replace('<application', add + '    <application', 1)
+          open(p, 'w', encoding='utf-8').write(s)
+          PY
+          grep -n "label\|permission" android/app/src/main/AndroidManifest.xml
+
+      - run: flutter pub get
+
+      - name: Icono de la app
+        run: dart run flutter_launcher_icons
+
+      - run: flutter build apk --debug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Geolocalizacion-APK
+          path: build/app/outputs/flutter-apk/app-debug.apk
