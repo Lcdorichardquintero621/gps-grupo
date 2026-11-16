@@ -3,13 +3,25 @@
 
 -- 1) Ubicaciones en tiempo real
 create table if not exists public.ubicaciones (
-  device_id   text primary key,
+  device_id   text not null,
   grupo       text not null,
   nombre      text,
   lat         double precision not null,
   lng         double precision not null,
-  actualizado timestamptz not null default now()
+  actualizado timestamptz not null default now(),
+  primary key (device_id, grupo)
 );
+
+-- Si la tabla ya existía con clave solo por device_id, la cambia a (device_id, grupo)
+do $$
+begin
+  if (select count(*) from information_schema.key_column_usage
+       where table_schema = 'public' and table_name = 'ubicaciones'
+         and constraint_name = 'ubicaciones_pkey') = 1 then
+    alter table public.ubicaciones drop constraint ubicaciones_pkey;
+    alter table public.ubicaciones add primary key (device_id, grupo);
+  end if;
+end $$;
 create index if not exists ubicaciones_grupo_idx on public.ubicaciones (grupo);
 
 -- 2) Grupos (para que sigan existiendo aunque salgas de la app)

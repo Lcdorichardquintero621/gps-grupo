@@ -38,10 +38,16 @@ jobs:
           s = open(p, encoding='utf-8').read()
           s = re.sub(r'android:label="[^"]*"', 'android:label="Geolocalizacion"', s, count=1)
           perms = ['INTERNET', 'ACCESS_FINE_LOCATION', 'ACCESS_COARSE_LOCATION',
-                   'FOREGROUND_SERVICE', 'FOREGROUND_SERVICE_LOCATION', 'POST_NOTIFICATIONS']
+                   'FOREGROUND_SERVICE', 'FOREGROUND_SERVICE_LOCATION', 'POST_NOTIFICATIONS',
+                   'REQUEST_IGNORE_BATTERY_OPTIMIZATIONS']
           add = ''.join('    <uses-permission android:name="android.permission.%s"/>\n' % x
                         for x in perms if 'android.permission.%s"' % x not in s)
           s = s.replace('<application', add + '    <application', 1)
+          servicio = ('    <service android:name="com.pravera.flutter_foreground_task.service.ForegroundService"\n'
+                      '        android:foregroundServiceType="location"\n'
+                      '        android:exported="false" />\n')
+          if 'flutter_foreground_task.service.ForegroundService' not in s:
+              s = s.replace('</application>', servicio + '  </application>', 1)
           open(p, 'w', encoding='utf-8').write(s)
           PY
           grep -n "label\|permission" android/app/src/main/AndroidManifest.xml

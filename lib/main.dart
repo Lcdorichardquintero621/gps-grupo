@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
@@ -15,6 +16,7 @@ const supabaseAnonKey = 'sb_publishable_komsbWhClsqyBL_QHkM-9w_9tMjYEz5';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  FlutterForegroundTask.initCommunicationPort();
   await Supabase.initialize(url: supabaseUrl, anonKey: supabaseAnonKey);
   runApp(const GeolocalizacionApp());
 }
@@ -96,6 +98,23 @@ class Almacen {
   static Future<void> quitar(String codigo) async {
     final g = await leer();
     await guardar(g.where((x) => x.codigo != codigo).toList());
+  }
+
+  // Grupos en los que compartes tu ubicación en segundo plano.
+  static Future<Set<String>> bgGrupos() async {
+    final p = await SharedPreferences.getInstance();
+    return (p.getStringList('bg_grupos') ?? <String>[]).toSet();
+  }
+
+  static Future<void> setBg(String codigo, bool activo) async {
+    final p = await SharedPreferences.getInstance();
+    final s = (p.getStringList('bg_grupos') ?? <String>[]).toSet();
+    if (activo) {
+      s.add(codigo);
+    } else {
+      s.remove(codigo);
+    }
+    await p.setStringList('bg_grupos', s.toList());
   }
 
   static Future<String> deviceId() async {
@@ -188,6 +207,182 @@ Future<void> eliminarGrupoServidor(Grupo g, String deviceId) async {
       .eq('creador', deviceId);
 }
 
+// ---------------------------------------------------------------------------
+// Compartir ubicación en segundo plano (servicio con notificación fija)
+// ---------------------------------------------------------------------------
+
+@pragma('vm:entry-point')
+void iniciarTareaUbicacion() {
+  FlutterForegroundTask.setTaskHandler(UbicacionTask());
+}
+
+// Corre en su propio "isolate": no usa la variable global `db`.
+class UbicacionTask extends TaskHandler {
+  SupabaseClient? _cli;
+  StreamSubscription<Position>? _sub;
+  Position? _ultima;
+  String _device = '';
+  String _nombre = '';
+  List<String> _grupos = [];
+
+  Future<void> _quitar(String grupo) async {
+    final c = _cli;
+    if (c == null || _device.isEmpty) return;
+    try {
+      await c
+          .from('ubicaciones')
+          .update({'actualizado': '1970-01-01T00:00:00Z'})
+          .eq('device_id', _device)
+          .eq('grupo', grupo);
+    } catch (_) {}
+    try {
+      await c
+          .from('ubicaciones')
+          .delete()
+          .eq('device_id', _device)
+          .eq('grupo', grupo);
+    } catch (_) {}
+  }
+
+  Future<void> _leer(String? json) async {
+    if (json == null) return;
+    try {
+      final m = jsonDecode(json) as Map<String, dynamic>;
+      final nuevos = (m['grupos'] as List).map((e) => '$e').toList();
+      final quitados = _grupos.where((g) => !nuevos.contains(g)).toList();
+      _device = '${m['device']}';
+      _nombre = '${m['nombre']}';
+      _grupos = nuevos;
+      for (final g in quitados) {
+        await _quitar(g);
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _enviar() async {
+    final p = _ultima;
+    final c = _cli;
+    if (p == null || c == null || _grupos.isEmpty || _device.isEmpty) return;
+    final ahora = DateTime.now().toUtc().toIso8601String();
+    for (final g in _grupos) {
+      try {
+        await c.from('ubicaciones').upsert({
+          'device_id': _device,
+          'grupo': g,
+          'nombre': _nombre,
+          'lat': p.latitude,
+          'lng': p.longitude,
+          'actualizado': ahora,
+        }, onConflict: 'device_id,grupo');
+      } catch (_) {}
+    }
+  }
+
+  @override
+  Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
+    _cli = SupabaseClient(supabaseUrl, supabaseAnonKey);
+    await _leer(await FlutterForegroundTask.getData<String>(key: 'config'));
+    try {
+      _ultima = await Geolocator.getLastKnownPosition();
+    } catch (_) {}
+    await _enviar();
+    _sub = Geolocator.getPositionStream(
+      locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high, distanceFilter: 5),
+    ).listen((p) {
+      _ultima = p;
+      _enviar();
+    }, onError: (_) {});
+  }
+
+  // Cada 20 segundos reenvía tu posición aunque no te muevas.
+  @override
+  void onRepeatEvent(DateTime timestamp) {
+    _enviar();
+  }
+
+  // La app manda aquí la lista de grupos actualizada.
+  @override
+  void onReceiveData(Object data) {
+    if (data is String) {
+      _leer(data).then((_) => _enviar());
+    }
+  }
+
+  @override
+  Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {
+    await _sub?.cancel();
+    for (final g in List<String>.from(_grupos)) {
+      await _quitar(g);
+    }
+  }
+}
+
+class ServicioBg {
+  static void _init() {
+    FlutterForegroundTask.init(
+      androidNotificationOptions: AndroidNotificationOptions(
+        channelId: 'geolocalizacion_bg',
+        channelName: 'Compartir ubicación',
+        channelDescription:
+            'Aviso fijo mientras compartes tu ubicación con tus grupos.',
+        onlyAlertOnce: true,
+      ),
+      iosNotificationOptions: const IOSNotificationOptions(
+          showNotification: false, playSound: false),
+      foregroundTaskOptions: ForegroundTaskOptions(
+        eventAction: ForegroundTaskEventAction.repeat(20000),
+        autoRunOnBoot: false,
+        allowWakeLock: true,
+        allowWifiLock: true,
+      ),
+    );
+  }
+
+  static Future<void> pedirPermisos() async {
+    try {
+      final np = await FlutterForegroundTask.checkNotificationPermission();
+      if (np != NotificationPermission.granted) {
+        await FlutterForegroundTask.requestNotificationPermission();
+      }
+      if (!await FlutterForegroundTask.isIgnoringBatteryOptimizations) {
+        await FlutterForegroundTask.requestIgnoreBatteryOptimization();
+      }
+    } catch (_) {}
+  }
+
+  // Arranca, actualiza o detiene el servicio según los grupos activados.
+  static Future<void> sincronizar(String nombre, String deviceId) async {
+    try {
+      final grupos = (await Almacen.bgGrupos()).toList();
+      final corriendo = await FlutterForegroundTask.isRunningService;
+      if (grupos.isEmpty || nombre.isEmpty) {
+        if (corriendo) await FlutterForegroundTask.stopService();
+        return;
+      }
+      final cfg = jsonEncode(
+          {'device': deviceId, 'nombre': nombre, 'grupos': grupos});
+      await FlutterForegroundTask.saveData(key: 'config', value: cfg);
+      _init();
+      if (corriendo) {
+        FlutterForegroundTask.sendDataToTask(cfg);
+      } else {
+        await FlutterForegroundTask.startService(
+          serviceId: 301,
+          notificationTitle: 'Geolocalizacion',
+          notificationText: 'Compartiendo tu ubicación con tus grupos',
+          callback: iniciarTareaUbicacion,
+        );
+      }
+    } catch (_) {}
+  }
+
+  static Future<void> desactivarGrupo(String codigo) async {
+    await Almacen.setBg(codigo, false);
+    await sincronizar(await Almacen.nombre(), await Almacen.deviceId());
+  }
+}
+
 Future<void> compartirWhatsApp(BuildContext context, Grupo g) async {
   final texto = 'Únete a mi grupo "${g.nombre}" en Geolocalizacion.\n'
       'Código de invitación: ${g.codigo}';
@@ -234,6 +429,7 @@ class GruposPage extends StatefulWidget {
 class _GruposPageState extends State<GruposPage> {
   final _nombre = TextEditingController();
   List<Grupo> _grupos = [];
+  Set<String> _bg = {};
   String _deviceId = '';
   bool _cargando = true;
 
@@ -253,7 +449,9 @@ class _GruposPageState extends State<GruposPage> {
     _deviceId = await Almacen.deviceId();
     _nombre.text = await Almacen.nombre();
     _grupos = await Almacen.leer();
+    _bg = await Almacen.bgGrupos();
     if (mounted) setState(() => _cargando = false);
+    ServicioBg.sincronizar(_nombre.text.trim(), _deviceId);
     _verificar();
   }
 
@@ -270,6 +468,10 @@ class _GruposPageState extends State<GruposPage> {
       if (quitados.isEmpty) return;
       _grupos = _grupos.where((g) => vivos.contains(g.codigo)).toList();
       await Almacen.guardar(_grupos);
+      for (final q in quitados) {
+        await ServicioBg.desactivarGrupo(q.codigo);
+      }
+      _bg = await Almacen.bgGrupos();
       if (!mounted) return;
       setState(() {});
       aviso(context,
@@ -398,6 +600,7 @@ class _GruposPageState extends State<GruposPage> {
     );
     if (!mounted) return;
     _grupos = await Almacen.leer();
+    _bg = await Almacen.bgGrupos();
     if (mounted) setState(() {});
     _verificar();
   }
@@ -410,9 +613,11 @@ class _GruposPageState extends State<GruposPage> {
             'volver a entrar con el código ${g.codigo}.',
         'Salir');
     if (!ok) return;
+    await ServicioBg.desactivarGrupo(g.codigo);
     await quitarMiUbicacion(g.codigo, _deviceId);
     _grupos = _grupos.where((x) => x.codigo != g.codigo).toList();
     await Almacen.guardar(_grupos);
+    _bg = await Almacen.bgGrupos();
     if (mounted) setState(() {});
   }
 
@@ -425,8 +630,10 @@ class _GruposPageState extends State<GruposPage> {
     if (!ok) return;
     try {
       await eliminarGrupoServidor(g, _deviceId);
+      await ServicioBg.desactivarGrupo(g.codigo);
       _grupos = _grupos.where((x) => x.codigo != g.codigo).toList();
       await Almacen.guardar(_grupos);
+      _bg = await Almacen.bgGrupos();
       if (mounted) setState(() {});
     } catch (e) {
       if (mounted) aviso(context, 'No se pudo eliminar: $e');
@@ -504,7 +711,7 @@ class _GruposPageState extends State<GruposPage> {
                                   child: Icon(Icons.groups)),
                               title: Text(g.nombre),
                               subtitle: Text(
-                                  'Código: ${g.codigo}${g.dueno ? '  ·  Lo creaste tú' : ''}'),
+                                  'Código: ${g.codigo}${g.dueno ? '  ·  Lo creaste tú' : ''}${_bg.contains(g.codigo) ? '\nCompartiendo en segundo plano' : ''}'),
                               onTap: () => _abrir(g),
                               trailing: Row(
                                   mainAxisSize: MainAxisSize.min,
@@ -570,17 +777,19 @@ class _MapaPageState extends State<MapaPage> {
   bool _ajustadoConmigo = false;
   bool _centrado = false;
   bool _compartiendo = true;
+  bool _bg = false;
   bool _cerrando = false;
   String _estado = 'Iniciando…';
   bool _estadoError = false;
 
   late final Stream<List<Map<String, dynamic>>> _stream = db
       .from('ubicaciones')
-      .stream(primaryKey: ['device_id']).eq('grupo', widget.grupo.codigo);
+      .stream(primaryKey: ['device_id', 'grupo']).eq('grupo', widget.grupo.codigo);
 
   @override
   void initState() {
     super.initState();
+    _cargarBg();
     _iniciarGps();
     // Reenvía tu posición cada 20 s aunque no te muevas.
     _latido = Timer.periodic(const Duration(seconds: 20), (_) {
@@ -590,6 +799,50 @@ class _MapaPageState extends State<MapaPage> {
     _vigia = Timer.periodic(
         const Duration(seconds: 30), (_) => _revisarGrupo());
     _revisarGrupo();
+  }
+
+  Future<void> _cargarBg() async {
+    final s = await Almacen.bgGrupos();
+    if (mounted) setState(() => _bg = s.contains(widget.grupo.codigo));
+    if (_bg) ServicioBg.sincronizar(widget.nombre, widget.deviceId);
+  }
+
+  Future<void> _alternarBg() async {
+    if (!_bg) {
+      final perm = await Geolocator.checkPermission();
+      if (perm == LocationPermission.denied ||
+          perm == LocationPermission.deniedForever) {
+        if (mounted) {
+          aviso(context, 'Primero permite el acceso a la ubicación.');
+        }
+        return;
+      }
+      if (!mounted) return;
+      final ok = await confirmar(
+          context,
+          'Compartir en segundo plano',
+          'Tu ubicación se enviará a "${widget.grupo.nombre}" aunque cierres '
+              'la app. Verás una notificación fija mientras esté activo y '
+              'puedes desactivarlo aquí cuando quieras.',
+          'Activar');
+      if (!ok) return;
+      await ServicioBg.pedirPermisos();
+      await Almacen.setBg(widget.grupo.codigo, true);
+      await ServicioBg.sincronizar(widget.nombre, widget.deviceId);
+      if (mounted) {
+        setState(() => _bg = true);
+        aviso(context, 'Compartiendo en segundo plano');
+      }
+    } else {
+      await ServicioBg.desactivarGrupo(widget.grupo.codigo);
+      if (!_compartiendo) {
+        await quitarMiUbicacion(widget.grupo.codigo, widget.deviceId);
+      }
+      if (mounted) {
+        setState(() => _bg = false);
+        aviso(context, 'Segundo plano desactivado');
+      }
+    }
   }
 
   void _setEstado(String t, {bool error = false}) {
@@ -617,6 +870,7 @@ class _MapaPageState extends State<MapaPage> {
     _gps?.cancel();
     _latido?.cancel();
     _vigia?.cancel();
+    await ServicioBg.desactivarGrupo(widget.grupo.codigo);
     await Almacen.quitar(widget.grupo.codigo);
     if (!mounted) return;
     final m = ScaffoldMessenger.of(context);
@@ -698,7 +952,7 @@ class _MapaPageState extends State<MapaPage> {
         'lat': p.latitude,
         'lng': p.longitude,
         'actualizado': DateTime.now().toUtc().toIso8601String(),
-      }, onConflict: 'device_id');
+      }, onConflict: 'device_id,grupo');
       if (!mounted) return;
       final t = TimeOfDay.now().format(context);
       _setEstado('Compartiendo ubicación ✓  (último envío $t)');
@@ -712,7 +966,7 @@ class _MapaPageState extends State<MapaPage> {
     if (_compartiendo) {
       if (_pos != null) _enviar(_pos!);
     } else {
-      quitarMiUbicacion(widget.grupo.codigo, widget.deviceId);
+      if (!_bg) quitarMiUbicacion(widget.grupo.codigo, widget.deviceId);
       _setEstado('Dejaste de compartir tu ubicación');
     }
   }
@@ -729,6 +983,7 @@ class _MapaPageState extends State<MapaPage> {
     _gps?.cancel();
     _latido?.cancel();
     _vigia?.cancel();
+    await ServicioBg.desactivarGrupo(widget.grupo.codigo);
     await quitarMiUbicacion(widget.grupo.codigo, widget.deviceId);
     await Almacen.quitar(widget.grupo.codigo);
     if (mounted) Navigator.pop(context);
@@ -752,6 +1007,7 @@ class _MapaPageState extends State<MapaPage> {
     _gps?.cancel();
     _latido?.cancel();
     _vigia?.cancel();
+    await ServicioBg.desactivarGrupo(widget.grupo.codigo);
     await Almacen.quitar(widget.grupo.codigo);
     if (mounted) Navigator.pop(context);
   }
@@ -775,8 +1031,9 @@ class _MapaPageState extends State<MapaPage> {
     _gps?.cancel();
     _latido?.cancel();
     _vigia?.cancel();
-    // Al volver a la lista dejas de compartir, pero sigues en el grupo.
-    quitarMiUbicacion(widget.grupo.codigo, widget.deviceId);
+    // Al volver a la lista dejas de compartir (salvo que tengas activado el
+    // segundo plano), pero sigues en el grupo.
+    if (!_bg) quitarMiUbicacion(widget.grupo.codigo, widget.deviceId);
     super.dispose();
   }
 
@@ -809,10 +1066,15 @@ class _MapaPageState extends State<MapaPage> {
           ),
           PopupMenuButton<String>(
             onSelected: (v) {
+              if (v == 'bg') _alternarBg();
               if (v == 'salir') _salirDelGrupo();
               if (v == 'eliminar') _eliminarGrupo();
             },
             itemBuilder: (_) => [
+              CheckedPopupMenuItem<String>(
+                  value: 'bg',
+                  checked: _bg,
+                  child: const Text('Compartir en segundo plano')),
               const PopupMenuItem(
                   value: 'salir', child: Text('Salir del grupo')),
               if (g.dueno)
